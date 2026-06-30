@@ -1,0 +1,46 @@
+services:
+  mysql:
+    image: mysql:8.4
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_DATABASE: kidoai
+      MYSQL_USER: kido
+      MYSQL_PASSWORD: kido
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: ./services/api
+    environment:
+      DATABASE_URL: mysql+pymysql://kido:kido@mysql:3306/kidoai?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_DIR: /data/uploads
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      API_CORS_ALLOW_ORIGINS: ${API_CORS_ALLOW_ORIGINS:-http://localhost:5173}
+    volumes:
+      - ./data:/data
+      - ./services/api:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mysql
+      - redis
+
+  child-web:
+    build:
+      context: ./apps/child-web
+    ports:
+      - "5173:5173"
+
+volumes:
+  mysql_data:
+

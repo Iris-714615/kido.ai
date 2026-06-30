@@ -1,0 +1,285 @@
+"""支付 API：创建订单、支付宝/微信异步回调、订单状态查询。"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import PlainTextResponse
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.core.bootstrap import ensure_free_subscription
+from app.dependencies import get_current_parent, get_db_session
+from app.models import PaymentOrder, Subscription, SubscriptionPlan, User
+from app.schemas import CreateOrderRequest, CreateOrderResponse, OrderStatusResponse
+from app.services.payment import (
+    alipay_verify_notify,
+    calc_subscription_period,
+    create_payment,
+    generate_order_no,
+    wechat_verify_notify,
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/payment", tags=["payment"])
+
+
+@router.post("/create-order", response_model=CreateOrderResponse)
+def create_order(
+    payload: CreateOrderRequest,
+    current_parent: User = Depends(get_current_parent),
+    db: Session = Depends(get_db_session),
+) -> CreateOrderResponse:
+    """创建支付订单。
+
+    流程：
+    1. 校验套餐存在且非免费
+    2. 获取/创建用户订阅记录
+    3. 创建订单（PENDING）
+    4. 调用支付渠道获取支付链接/二维码
+    5. 返回支付参数给前端
+    """
+    # 查找套餐
+    plan = db.scalar(
+        select(SubscriptionPlan).where(
+            SubscriptionPlan.code == payload.plan_code,
+            SubscriptionPlan.is_active == True,  # noqa: E712
+        )
+    )
+    if plan is None:
+        raise HTTPException(status_code=404, detail="套餐不存在或已下架")
+    if plan.price_cents == 0:
+        raise HTTPException(status_code=400, detail="免费套餐无需支付")
+
+    # 校验支付渠道
+    channel = payload.channel.upper()
+    if channel not in ("ALIPAY", "WECHAT"):
+        raise HTTPException(status_code=400, detail="不支持的支付渠道")
+
+    # 确保用户有订阅记录
+    sub = ensure_free_subscription(db, current_parent.id)
+
+    # 创建订单
+    order_no = generate_order_no()
+    order = PaymentOrder(
+        order_no=order_no,
+        user_id=current_parent.id,
+        subscription_id=sub.id,
+        plan_id=plan.id,
+        amount_cents=plan.price_cents,
+        channel=channel,
+        status="PENDING",
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+
+    # 调用支付渠道
+    subject = f"KidoAI {plan.name}"
+    try:
+        pay_result = create_payment(channel, order_no, plan.price_cents, subject)
+    except Exception as exc:
+        logger.error("Create payment failed: %s", exc)
+        raise HTTPException(status_code=500, detail="支付渠道调用失败") from exc
+
+    return CreateOrderResponse(
+        order_no=order_no,
+        amount_cents=plan.price_cents,
+        channel=channel,
+        pay_url=pay_result.get("pay_url"),
+        qr_code=pay_result.get("qr_code"),
+        plan_name=plan.name,
+        plan_code=plan.code,
+    )
+
+
+@router.post("/alipay/notify")
+async def alipay_notify(request: Request, db: Session = Depends(get_db_session)) -> PlainTextResponse:
+    """支付宝异步回调通知。
+
+    支付宝要求返回纯文本 "success"，否则会重试通知。
+    """
+    form_data = await request.form()
+    data = {k: v for k, v in form_data.items()}
+    logger.info("Alipay notify received: out_trade_no=%s", data.get("out_trade_no"))
+
+    # 验签
+    if not alipay_verify_notify(data):
+        logger.warning("Alipay notify verify failed")
+        return PlainTextResponse("fail")
+
+    order_no = data.get("out_trade_no", "")
+    trade_no = data.get("trade_no", "")
+    trade_status = data.get("trade_status", "")
+
+    # 只处理成功的交易
+    if trade_status not in ("TRADE_SUCCESS", "TRADE_FINISHED"):
+        return PlainTextResponse("success")
+
+    # 更新订单
+    order = db.scalar(select(PaymentOrder).where(PaymentOrder.order_no == order_no))
+    if order is None:
+        logger.warning("Order not found: %s", order_no)
+        return PlainTextResponse("success")
+
+    if order.status == "PAID":
+        # 已处理过，幂等返回
+        return PlainTextResponse("success")
+
+    order.status = "PAID"
+    order.trade_no = trade_no
+    order.paid_at = datetime.now(timezone.utc)
+    order.raw_notify_json = data
+    db.flush()
+
+    # 激活订阅
+    _activate_subscription(db, order)
+    db.commit()
+
+    return PlainTextResponse("success")
+
+
+@router.post("/wechat/notify")
+async def wechat_notify(request: Request, db: Session = Depends(get_db_session)) -> dict:
+    """微信支付异步回调通知。
+
+    微信要求返回 {"code": "SUCCESS", "message": "成功"}。
+    """
+    body = await request.body()
+    headers = dict(request.headers)
+    logger.info("WeChat notify received")
+
+    # 验签 + 解密
+    notify_data = wechat_verify_notify(headers, body)
+    if notify_data is None:
+        logger.warning("WeChat notify verify failed")
+        return {"code": "FAIL", "message": "验签失败"}
+
+    order_no = notify_data.get("out_trade_no", "")
+    trade_no = notify_data.get("transaction_id", "")
+    trade_state = notify_data.get("trade_state", "")
+
+    if trade_state != "SUCCESS":
+        return {"code": "SUCCESS", "message": "成功"}
+
+    order = db.scalar(select(PaymentOrder).where(PaymentOrder.order_no == order_no))
+    if order is None:
+        logger.warning("Order not found: %s", order_no)
+        return {"code": "SUCCESS", "message": "成功"}
+
+    if order.status == "PAID":
+        return {"code": "SUCCESS", "message": "成功"}
+
+    order.status = "PAID"
+    order.trade_no = trade_no
+    order.paid_at = datetime.now(timezone.utc)
+    order.raw_notify_json = notify_data
+    db.flush()
+
+    _activate_subscription(db, order)
+    db.commit()
+
+    return {"code": "SUCCESS", "message": "成功"}
+
+
+@router.get("/order/{order_no}", response_model=OrderStatusResponse)
+def query_order(
+    order_no: str,
+    current_parent: User = Depends(get_current_parent),
+    db: Session = Depends(get_db_session),
+) -> OrderStatusResponse:
+    """查询订单状态（前端轮询用）。"""
+    order = db.scalar(select(PaymentOrder).where(PaymentOrder.order_no == order_no))
+    if order is None:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.user_id != current_parent.id:
+        raise HTTPException(status_code=403, detail="无权查看此订单")
+
+    plan = db.get(SubscriptionPlan, order.plan_id)
+    return OrderStatusResponse(
+        order_no=order.order_no,
+        status=order.status,
+        channel=order.channel,
+        amount_cents=order.amount_cents,
+        paid_at=order.paid_at,
+        plan_name=plan.name if plan else None,
+    )
+
+
+@router.post("/mock-pay/{order_no}")
+def mock_pay(
+    order_no: str,
+    current_parent: User = Depends(get_current_parent),
+    db: Session = Depends(get_db_session),
+) -> dict:
+    """模拟支付成功（仅开发环境使用，跳过真实支付流程）。"""
+    order = db.scalar(select(PaymentOrder).where(PaymentOrder.order_no == order_no))
+    if order is None:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.user_id != current_parent.id:
+        raise HTTPException(status_code=403, detail="无权操作此订单")
+    if order.status == "PAID":
+        return {"success": True, "message": "订单已支付"}
+
+    order.status = "PAID"
+    order.trade_no = f"MOCK_{order_no}"
+    order.paid_at = datetime.now(timezone.utc)
+    order.raw_notify_json = {"mock": True}
+    db.flush()
+
+    _activate_subscription(db, order)
+    db.commit()
+
+    return {"success": True, "message": "模拟支付成功，订阅已激活"}
+
+
+def _activate_subscription(db: Session, order: PaymentOrder) -> None:
+    """支付成功后激活订阅：更新套餐、延长到期时间。"""
+    plan = db.get(SubscriptionPlan, order.plan_id)
+    if plan is None:
+        return
+
+    sub = db.get(Subscription, order.subscription_id)
+    if sub is None:
+        return
+
+    start_at, expire_at = calc_subscription_period(plan.billing_cycle)
+
+    # 如果当前订阅未过期，在原到期时间基础上续期
+    # 注意：SQLite 返回 naive datetime，需统一用 naive UTC
+    now = datetime.utcnow()
+    sub_expire = sub.expire_at
+    if sub_expire and sub_expire.tzinfo is not None:
+        sub_expire = sub_expire.replace(tzinfo=None)
+    if sub_expire and sub_expire > now and sub.status == "ACTIVE":
+        base = sub_expire
+    else:
+        base = now
+
+    if plan.billing_cycle == "MONTHLY":
+        from datetime import timedelta
+
+        new_expire = base + timedelta(days=30)
+    elif plan.billing_cycle == "YEARLY":
+        from datetime import timedelta
+
+        new_expire = base + timedelta(days=365)
+    else:
+        from datetime import timedelta
+
+        new_expire = base + timedelta(days=365 * 100)
+
+    sub.plan_id = plan.id
+    sub.status = "ACTIVE"
+    sub.start_at = now
+    sub.expire_at = new_expire
+    sub.auto_renew = False
+    db.flush()
+    logger.info(
+        "Subscription activated: user=%s plan=%s expire=%s",
+        order.user_id,
+        plan.code,
+        new_expire,
+    )
