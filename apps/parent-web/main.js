@@ -1,7 +1,7 @@
 import { createApp, reactive, ref, onMounted, computed, watch } from "https://unpkg.com/vue@3/dist/vue.esm-browser.js";
 
 // ========== API 配置 ==========
-const DEV_API_BASE = "http://localhost:8000/api/v1";
+const DEV_API_BASE = "http://localhost:8001/api/v1";
 const PROD_API_BASE = "/api/v1";
 const API_BASE =
   (location.hostname === "localhost" || location.hostname === "127.0.0.1")
@@ -138,8 +138,7 @@ const app = createApp({
   `,
   computed: {
     currentView() {
-      // 开发模式：跳过登录页
-      // if (!this.isLoggedIn) return "auth-page";
+      if (!this.isLoggedIn) return "auth-page";
       switch (route.tab) {
         case "growth": return "growth-page";
         case "moments": return "moments-page";
@@ -184,10 +183,12 @@ app.component("auth-page", {
         <h1 class="auth-title">KidoAI 家长端</h1>
         <p class="auth-sub">陪伴孩子探索世界</p>
         <div class="tabs">
-          <button :class="{active: mode==='login'}" @click="mode='login'">登录</button>
+          <button :class="{active: mode==='login'}" @click="mode='login'">账号登录</button>
           <button :class="{active: mode==='register'}" @click="mode='register'">注册</button>
+          <button :class="{active: mode==='otp'}" @click="mode='otp'">验证码登录</button>
         </div>
-        <form @submit.prevent="submit">
+        <!-- 账号登录/注册 -->
+        <form v-if="mode !== 'otp'" @submit.prevent="submit">
           <div class="field">
             <label>用户名</label>
             <input v-model="form.username" required minlength="3" maxlength="50" placeholder="3-50 字符" />
@@ -201,6 +202,27 @@ app.component("auth-page", {
           </button>
           <p v-if="error" class="error">{{ error }}</p>
         </form>
+        <!-- 验证码登录 -->
+        <form v-else @submit.prevent="submitOtp">
+          <div class="field">
+            <label>手机号</label>
+            <input v-model="otpForm.phone" required pattern="^1[3-9]\\d{9}$" maxlength="11" placeholder="中国大陆手机号" />
+          </div>
+          <div class="field otp-row">
+            <label>验证码</label>
+            <div class="otp-input-row">
+              <input v-model="otpForm.code" required maxlength="6" pattern="\\d{6}" placeholder="6 位数字" />
+              <button type="button" class="btn-otp" @click="sendOtp" :disabled="otpCooldown > 0 || sendingOtp">
+                {{ otpCooldown > 0 ? otpCooldown + 's' : (sendingOtp ? '发送中' : '获取验证码') }}
+              </button>
+            </div>
+          </div>
+          <button class="btn-primary" type="submit" :disabled="loading">
+            {{ loading ? "验证中..." : "验证码登录" }}
+          </button>
+          <p v-if="error" class="error">{{ error }}</p>
+          <p v-if="otpHint" class="hint">{{ otpHint }}</p>
+        </form>
       </div>
     </section>`,
   setup() {
@@ -208,6 +230,13 @@ app.component("auth-page", {
     const form = reactive({ username: "", password: "" });
     const loading = ref(false);
     const error = ref("");
+    // OTP 相关
+    const otpForm = reactive({ phone: "", code: "" });
+    const otpCooldown = ref(0);
+    const sendingOtp = ref(false);
+    const otpHint = ref("");
+    let cooldownTimer = null;
+
     async function submit() {
       loading.value = true; error.value = "";
       try {
@@ -219,7 +248,77 @@ app.component("auth-page", {
         switchTab("growth");
       } catch (e) { error.value = e.message; } finally { loading.value = false; }
     }
-    return { mode, form, loading, error, submit, switchTab };
+
+    async function sendOtp() {
+      if (!/^1[3-9]\d{9}$/.test(otpForm.phone)) {
+        error.value = "请输入正确的手机号";
+        return;
+      }
+      error.value = ""; otpHint.value = "";
+      sendingOtp.value = true;
+      try {
+        await api("/notify/send-otp", {
+          method: "POST",
+          body: JSON.stringify({ phone: otpForm.phone }),
+        });
+        // 启动 60s 倒计时
+        otpCooldown.value = 60;
+        cooldownTimer = setInterval(() => {
+          otpCooldown.value--;
+          if (otpCooldown.value <= 0) {
+            clearInterval(cooldownTimer);
+          }
+        }, 1000);
+        otpHint.value = "验证码已发送，5 分钟内有效（开发 Mock 模式接受 123456）";
+      } catch (e) {
+        if (e.message.includes("429") || e.message.includes("频繁")) {
+          error.value = "发送过于频繁，请稍后再试";
+        } else {
+          error.value = "验证码发送失败: " + e.message;
+        }
+      } finally {
+        sendingOtp.value = false;
+      }
+    }
+
+    async function submitOtp() {
+      loading.value = true; error.value = "";
+      try {
+        // 1. 先校验验证码
+        await api("/notify/verify-otp", {
+          method: "POST",
+          body: JSON.stringify({ phone: otpForm.phone, code: otpForm.code }),
+        });
+        // 2. 校验通过 → 用手机号登录（若不存在则注册）
+        try {
+          const data = await api("/auth/login", {
+            method: "POST",
+            body: JSON.stringify({ username: otpForm.phone, password: "otp_" + otpForm.code, role: "PARENT" }),
+          });
+          setAuth(data.access_token, data.user);
+          switchTab("growth");
+        } catch (loginErr) {
+          // 账号不存在 → 自动注册
+          try {
+            const data = await api("/auth/register", {
+              method: "POST",
+              body: JSON.stringify({ username: otpForm.phone, password: "otp_" + otpForm.code, role: "PARENT", nickname: "家长" + otpForm.phone.slice(-4) }),
+            });
+            setAuth(data.access_token, data.user);
+            switchTab("growth");
+          } catch (regErr) {
+            error.value = "注册失败: " + regErr.message;
+          }
+        }
+      } catch (e) {
+        error.value = e.message || "验证码校验失败";
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    return { mode, form, loading, error, submit, switchTab,
+             otpForm, otpCooldown, sendingOtp, otpHint, sendOtp, submitOtp };
   },
 });
 
@@ -1022,6 +1121,40 @@ app.component("subscription-page", {
       </div>
 
       <div style="height: 80px"></div>
+
+      <!-- 退出登录 -->
+      <div class="sub-section-title">账号</div>
+      <div class="sub-notify-card">
+        <button class="btn-notify logout-btn" @click="handleLogout">退出登录</button>
+      </div>
+
+      <!-- 通知测试区 -->
+      <div class="sub-section-title">通知测试</div>
+      <div class="sub-notify-card">
+        <p class="notify-desc">测试短信/邮件通知系统是否正常工作</p>
+        <div class="notify-tabs">
+          <button :class="{active: notifyTab==='sms'}" @click="notifyTab='sms'">短信验证码</button>
+          <button :class="{active: notifyTab==='email'}" @click="notifyTab='email'">测试邮件</button>
+        </div>
+        <!-- 短信测试 -->
+        <div v-if="notifyTab==='sms'" class="notify-form">
+          <input v-model="notifyPhone" placeholder="手机号" pattern="^1[3-9]\d{9}$" maxlength="11" />
+          <button class="btn-notify" @click="sendTestOtp" :disabled="notifySending">
+            {{ notifySending ? '发送中...' : '发送验证码' }}
+          </button>
+          <p v-if="notifyMsg" class="notify-msg" :class="{err: notifyErr}">{{ notifyMsg }}</p>
+        </div>
+        <!-- 邮件测试 -->
+        <div v-else class="notify-form">
+          <input v-model="testEmail.to" placeholder="收件邮箱" type="email" />
+          <input v-model="testEmail.subject" placeholder="邮件主题" />
+          <textarea v-model="testEmail.body" placeholder="邮件正文" rows="3"></textarea>
+          <button class="btn-notify" @click="sendTestEmail" :disabled="notifySending">
+            {{ notifySending ? '发送中...' : '发送测试邮件' }}
+          </button>
+          <p v-if="notifyMsg" class="notify-msg" :class="{err: notifyErr}">{{ notifyMsg }}</p>
+        </div>
+      </div>
     </section>
   `,
   setup() {
@@ -1171,12 +1304,69 @@ app.component("subscription-page", {
       loadOrders();
     });
 
+    // ========== 通知测试 ==========
+    const notifyTab = ref("sms");
+    const notifyPhone = ref("");
+    const notifySending = ref(false);
+    const notifyMsg = ref("");
+    const notifyErr = ref(false);
+    const testEmail = reactive({ to: "", subject: "KidoAI 测试邮件", body: "这是一封来自 KidoAI 的测试邮件。" });
+
+    async function sendTestOtp() {
+      if (!/^1[3-9]\d{9}$/.test(notifyPhone.value)) {
+        notifyErr.value = true; notifyMsg.value = "请输入正确的手机号"; return;
+      }
+      notifySending.value = true; notifyMsg.value = ""; notifyErr.value = false;
+      try {
+        await api("/notify/send-otp", {
+          method: "POST",
+          body: JSON.stringify({ phone: notifyPhone.value }),
+        });
+        notifyErr.value = false;
+        notifyMsg.value = "✅ 验证码已发送（开发 Mock 模式接受 123456）";
+      } catch (e) {
+        notifyErr.value = true;
+        notifyMsg.value = "发送失败: " + e.message;
+      } finally {
+        notifySending.value = false;
+      }
+    }
+
+    async function sendTestEmail() {
+      if (!testEmail.to || !testEmail.subject) {
+        notifyErr.value = true; notifyMsg.value = "请填写邮箱和主题"; return;
+      }
+      notifySending.value = true; notifyMsg.value = ""; notifyErr.value = false;
+      try {
+        await api("/notify/send-test-email", {
+          method: "POST",
+          body: JSON.stringify({ email: testEmail.to, subject: testEmail.subject, body: testEmail.body }),
+        });
+        notifyErr.value = false;
+        notifyMsg.value = "✅ 邮件发送成功";
+      } catch (e) {
+        notifyErr.value = true;
+        notifyMsg.value = "发送失败: " + e.message;
+      } finally {
+        notifySending.value = false;
+      }
+    }
+
+    function handleLogout() {
+      if (confirm("确定要退出登录吗？")) {
+        clearAuth();
+        switchTab("growth");
+      }
+    }
+
     return {
       plans, paidPlans, currentSub, orders,
       selectedPlanCode, selectedPlanPrice,
       payChannel, paying, polling, payModal,
       handleCreateOrder, closePayModal, checkPayResult, mockPay,
       formatDate, orderStatusText, switchTab,
+      notifyTab, notifyPhone, notifySending, notifyMsg, notifyErr, testEmail,
+      sendTestOtp, sendTestEmail, handleLogout,
     };
   },
 });

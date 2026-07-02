@@ -1,8 +1,11 @@
-"""支付 API：创建订单、支付宝/微信异步回调、订单状态查询。"""
+"""支付 API：创建订单、支付宝/微信异步回调、订单状态查询。
+"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -236,7 +239,7 @@ def mock_pay(
 
 
 def _activate_subscription(db: Session, order: PaymentOrder) -> None:
-    """支付成功后激活订阅：更新套餐、延长到期时间。"""
+    """支付成功后激活订阅：更新套餐、延长到期时间、发送通知。"""
     plan = db.get(SubscriptionPlan, order.plan_id)
     if plan is None:
         return
@@ -283,3 +286,81 @@ def _activate_subscription(db: Session, order: PaymentOrder) -> None:
         plan.code,
         new_expire,
     )
+
+    # ========== 发送支付成功通知 (多通道路由 · 异步化) ==========
+    # 通知逻辑改为异步执行，避免阻塞支付回调响应（规范第 14 节 P1 优化）
+    user = db.get(User, order.user_id)
+    if user and user.username:
+        # 捕获本次通知所需的快照数据（避免异步上下文中 db session 已关闭）
+        notif_snapshot = {
+            "user_id": user.id,
+            "username": user.username,
+            "order_no": order.order_no,
+            "amount_cents": order.amount_cents,
+            "channel": order.channel,
+            "plan_name": plan.name,
+            "plan_code": plan.code,
+        }
+        try:
+            asyncio.create_task(_send_payment_notification_async(notif_snapshot))
+        except RuntimeError:
+            # 没有 event loop（同步调用上下文）→ 退化为同步发送
+            _send_payment_notification_sync(notif_snapshot)
+
+
+async def _send_payment_notification_async(snapshot: dict) -> None:
+    """异步发送支付成功通知。
+
+    将阻塞 I/O（Resend/SMTP/SMS SDK）从支付回调线程中剥离，
+    避免回调响应超过 5s 触发支付渠道重试。
+    """
+    try:
+        await asyncio.to_thread(_send_payment_notification_sync, snapshot)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to send payment success notification (async): %s", exc, exc_info=True)
+
+
+def _send_payment_notification_sync(snapshot: dict) -> None:
+    """同步执行支付成功通知（多通道路由）。
+
+    被 async 包装调用或在无 event loop 时直接调用。
+    """
+    try:
+        username = snapshot.get("username")
+        user_id = snapshot.get("user_id")
+        if not username:
+            return
+
+        from jinja2 import Environment, FileSystemLoader
+        template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "templates")
+        env = Environment(loader=FileSystemLoader(template_dir))
+        template = env.get_template("payment_success.html")
+        html_content = template.render(
+            order_no=snapshot.get("order_no"),
+            plan_name=snapshot.get("plan_name"),
+            plan_code=snapshot.get("plan_code"),
+            amount_cents=snapshot.get("amount_cents"),
+            channel=snapshot.get("channel"),
+        )
+
+        # 如果用户名是邮箱，发邮件；如果是大陆手机号，发短信
+        if "@" in username:
+            from app.services.notification import send_email
+            send_email(
+                to_email=username,
+                subject=f"【KidoAI】您的订阅 {snapshot.get('plan_name')} 已成功激活！",
+                html_content=html_content,
+                user_id=user_id,
+            )
+        elif len(username) == 11 and username.isdigit():
+            from app.core.settings import get_settings
+            from app.services.notification import send_aliyun_sms
+            settings = get_settings()
+            send_aliyun_sms(
+                phone=username,
+                template_code=settings.aliyun_sms_template_code_recharge or "SMS_DEFAULT_RECHARGE",
+                template_param={"plan_name": snapshot.get("plan_name"), "order_no": snapshot.get("order_no")},
+                user_id=user_id,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to send payment success notification: %s", exc, exc_info=True)

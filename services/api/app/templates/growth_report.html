@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>KidoAI 熊宝成长报告</title>
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background-color: #f7f9fa; color: #333333; margin: 0; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 30px; }
+        .header { text-align: center; border-bottom: 2px solid #edf2f7; padding-bottom: 20px; }
+        .logo { font-size: 24px; font-weight: bold; color: #4F46E5; }
+        .title { font-size: 20px; font-weight: bold; margin-top: 15px; color: #1F2937; }
+        .content { margin-top: 25px; line-height: 1.6; font-size: 15px; }
+        .highlight { color: #4F46E5; font-weight: bold; }
+        .card { background-color: #F9FAFB; border-radius: 8px; padding: 15px; margin: 20px 0; border-left: 4px solid #10B981; }
+        .footer { text-align: center; font-size: 12px; color: #9CA3AF; margin-top: 30px; border-top: 1px solid #edf2f7; padding-top: 15px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🧸 KidoAI 少儿成长陪伴</div>
+            <div class="title">✨ 【{{ nickname }}】的小探险家每日成长快报</div>
+        </div>
+        <div class="content">
+            <p>尊敬的家长，您好：</p>
+            <p>今天，熊宝陪伴孩子进行了深度科学探索。以下是小主人 <span class="highlight">【{{ nickname }}】</span>（{{ age }}岁）在今日的学习与对话画像：</p>
+            
+            <div class="card">
+                <strong>📈 今日数据看板：</strong>
+                <ul>
+                    <li>科学探索次数：<span class="highlight">{{ statistics.explore_count }}</span> 次</li>
+                    <li>多轮对话总量：<span class="highlight">{{ statistics.chat_count }}</span> 次</li>
+                    <li>解锁新技能词条数：<span class="highlight">{{ statistics.new_entities }}</span> 个</li>
+                </ul>
+            </div>
+
+            <p><strong>💡 熊宝 AI 深度画像分析：</strong></p>
+            <p style="white-space: pre-line; background: #FFFBEB; padding: 15px; border-radius: 8px; border: 1px dashed #F59E0B;">{{ ai_analysis }}</p>
+
+            <p><strong>🎯 亲子互动与线下拓展实验推荐：</strong></p>
+            <ul>
+                {% for suggestion in ai_suggestions %}
+                <li>{{ suggestion }}</li>
+                {% endfor %}
+            </ul>
+
+            <p style="margin-top:20px;">请登录 KidoAI 家长端控制台，查看完整的 3D 兴趣雷达图谱与详细报告！</p>
+        </div>
+        <div class="footer">
+            <p>本邮件为系统自动发送，请勿直接回复。<br>&copy; 2026 KidoAI Intelligent Growth Platform. All Rights Reserved.</p>
+        </div>
+    </div>
+</body>
+</html>

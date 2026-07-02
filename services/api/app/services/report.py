@@ -1,14 +1,9 @@
-"""成长报告生成服务。
-
-链式编排流程（对应 LangChain 的 SequentialChain 思想）：
-    数据采集 → Memory 画像构建 → Prompt 组装 → LLM 调用 → 结果缓存
-
-报告按 (child_id, date) 缓存到 growth_reports 表，当天有新数据才重新生成。
+"""成长报告生成与发送服务。
 """
-
 from __future__ import annotations
 
 import re
+import os
 from datetime import date
 from typing import Any
 
@@ -23,6 +18,7 @@ from app.models import (
     GrowthReport,
     MemoryEntity,
     MemoryEvent,
+    User,
 )
 from app.services.ai import build_growth_report
 from app.services.profile import build_child_profile
@@ -34,16 +30,7 @@ async def generate_report(
     child: ChildProfile,
     target_date: date | None = None,
 ) -> GrowthReport:
-    """生成成长报告（带缓存）。
-
-    流程：
-    1. 检查当天缓存，无新数据则直接返回
-    2. 采集统计数据（探索/聊天/记忆）
-    3. 构建 Memory 画像（兴趣聚类、行为分析）
-    4. 组装 Prompt（系统提示词 + 用户提示词）
-    5. 调用 LLM（LangChain + DeepSeek）生成分析
-    6. 写入/更新缓存
-    """
+    """生成成长报告（带缓存，并自动触发家长端邮件通知）。"""
     target_date = target_date or date.today()
 
     # 1. 检查缓存
@@ -96,13 +83,11 @@ async def generate_report(
     )
 
     # 6. 调用 LLM 生成分析（LangChain + DeepSeek）
-    #    若 LLM 调用失败（如 API key 未配置/网络异常），降级到 FallbackProvider 保证可用性
     from app.services.ai import FallbackProvider
 
     try:
         ai_analysis = await build_growth_report(REPORT_SYSTEM_PROMPT, user_prompt)
     except Exception as e:
-        # 记录日志，降级到规则模板生成
         import logging
         logging.getLogger(__name__).warning(
             "LLM 生成成长报告失败，降级到 FallbackProvider: %s", e
@@ -133,6 +118,36 @@ async def generate_report(
 
     db.commit()
     db.refresh(cached)
+
+    # ========== 定时/实时发送成长报告给家长 ==========
+    try:
+        # 寻找对应的家长账户
+        if child.parent_user_id:
+            parent_user = db.get(User, child.parent_user_id)
+            if parent_user and parent_user.username and "@" in parent_user.username:
+                from jinja2 import Environment, FileSystemLoader
+                template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "templates")
+                env = Environment(loader=FileSystemLoader(template_dir))
+                template = env.get_template("growth_report.html")
+                html_content = template.render(
+                    nickname=child.nickname,
+                    age=child.age,
+                    statistics=statistics,
+                    ai_analysis=ai_analysis,
+                    ai_suggestions=suggestions
+                )
+
+                from app.services.notification import send_email
+                send_email(
+                    to_email=parent_user.username,
+                    subject=f"【KidoAI】小主人 {child.nickname} 的今日成长快报已生成！",
+                    html_content=html_content,
+                    user_id=parent_user.id
+                )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("Failed to send growth report notification email: %s", exc)
+
     return cached
 
 
@@ -171,13 +186,7 @@ def _collect_statistics(db: Session, child_id: int) -> dict[str, Any]:
 
 
 def _extract_suggestions(analysis: str) -> list[str]:
-    """从 LLM 分析文本的"引导建议"段落提取建议列表。
-
-    支持多种 markdown 列表格式：
-    - 数字列表：1. / 1、
-    - 符号列表：- / *
-    - emoji 列表：✅ / ⭐ / 💡 等
-    """
+    """从 LLM 分析文本的"引导建议"段落提取建议列表。"""
     suggestions: list[str] = []
     in_suggestion_section = False
     for line in analysis.split("\n"):
@@ -189,15 +198,30 @@ def _extract_suggestions(analysis: str) -> list[str]:
             # 遇到下一个二级标题则结束
             if stripped.startswith("## "):
                 break
-            # 匹配多种列表项开头：数字./数字、/-/*/✅/⭐/💡 等 emoji
             match = re.match(
                 r"^(?:\d+[.、)\s]|[-*]\s+|[\u2705\u2B50\u2728\u2600-\u27BF\U0001F300-\U0001FAFF]\s*)\**\s*(.+?)\**\s*$",
                 stripped,
             )
             if match:
                 content = match.group(1).strip()
-                # 去掉残留的 markdown 加粗符号
                 content = content.replace("**", "")
                 if content:
                     suggestions.append(content)
     return suggestions[:3]
+
+
+async def generate_daily_reports_job() -> None:
+    """由 APScheduler 触发的每日成长报告群发定时任务"""
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        # 获取所有绑定了家长的孩子档案
+        children = db.scalars(select(ChildProfile).where(ChildProfile.parent_user_id != None)).all()
+        for child in children:
+            try:
+                await generate_report(db, child)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error("Error generating daily report for child %s: %s", child.id, e)
+    finally:
+        db.close()

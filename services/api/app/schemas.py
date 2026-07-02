@@ -38,6 +38,7 @@ class RegisterRequest(BaseModel):
     nickname: str | None = Field(default=None, max_length=50)
     age: int | None = Field(default=None, ge=3, le=12)
     parent_username: str | None = Field(default=None, max_length=50)
+    email: str | None = Field(default=None, description="注册邮箱，用于发送欢迎邮件")
 
 
 class LoginRequest(BaseModel):

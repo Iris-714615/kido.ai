@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>KidoAI 订阅充值确认</title>
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background-color: #f3f4f6; color: #111827; margin: 0; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); padding: 30px; border-top: 6px solid #10B981; }
+        .header { text-align: center; padding-bottom: 20px; }
+        .logo { font-size: 22px; font-weight: bold; color: #10B981; }
+        .content { margin-top: 25px; line-height: 1.6; font-size: 15px; }
+        .receipt { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        .receipt td { padding: 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; }
+        .receipt td.label { color: #6b7280; font-weight: 500; }
+        .receipt td.val { text-align: right; font-weight: bold; }
+        .footer { text-align: center; font-size: 12px; color: #9ca3af; margin-top: 30px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🎉 交易充值成功通知</div>
+        </div>
+        <div class="content">
+            <p>尊敬的 KidoAI 用户：</p>
+            <p>您的账户订阅升级/充值已成功到账。感谢您对少儿 AI 陪伴成长事业的大力支持！</p>
+            
+            <table class="receipt">
+                <tr>
+                    <td class="label">订单号</td>
+                    <td class="val">{{ order_no }}</td>
+                </tr>
+                <tr>
+                    <td class="label">购买服务</td>
+                    <td class="val">{{ plan_name }} ({{ plan_code }})</td>
+                </tr>
+                <tr>
+                    <td class="label">实付金额</td>
+                    <td class="val">￥{{ "%.2f"|format(amount_cents / 100) }}</td>
+                </tr>
+                <tr>
+                    <td class="label">充值渠道</td>
+                    <td class="val">{{ channel }}</td>
+                </tr>
+                <tr>
+                    <td class="label">状态</td>
+                    <td class="val" style="color: #10B981;">已支付 (PAID)</td>
+                </tr>
+            </table>
+
+            <p>您的新订阅套餐功能和可用额度已实时激活，现在可以带小主人畅享更高级的科普探险、自定义插画书共创和无限量记忆图谱啦！</p>
+        </div>
+        <div class="footer">
+            <p>KidoAI 运营中心<br>&copy; 2026 KidoAI Co. Ltd.</p>
+        </div>
+    </div>
+</body>
+</html>

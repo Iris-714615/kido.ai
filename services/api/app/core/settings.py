@@ -65,6 +65,25 @@ class Settings(BaseSettings):
     coze_bot_id: str | None = None
     coze_user_id_prefix: str = "kidoai-child-"
 
+    # ========== 短信与邮箱通知配置 ==========
+    # 短信 (Aliyun SMS)
+    sms_provider: str = "fallback"  # aliyun / fallback
+    aliyun_sms_access_key_id: str = ""
+    aliyun_sms_access_key_secret: str = ""
+    aliyun_sms_sign_name: str = ""
+    aliyun_sms_template_code_otp: str = ""  # 注册验证码模板
+    aliyun_sms_template_code_recharge: str = ""  # 充值成功通知模板
+    aliyun_sms_template_code_report: str = ""  # 成长报告提审/更新模板
+
+    # 邮箱 (SMTP or Resend API)
+    email_provider: str = "fallback"  # resend / smtp / fallback
+    resend_api_key: str = ""
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    email_sender: str = "KidoAI <noreply@kidoai.com>"
+
     # ========== 支付配置 ==========
     # 支付宝
     alipay_app_id: str = ""

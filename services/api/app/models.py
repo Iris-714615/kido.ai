@@ -32,6 +32,7 @@ class User(Base, TimestampMixin):
     username: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.CHILD)
+    email: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
 
     child_profile = relationship(
         "ChildProfile",
@@ -44,6 +45,7 @@ class User(Base, TimestampMixin):
         foreign_keys="ChildProfile.parent_user_id",
         back_populates="parent",
     )
+    subscriptions = relationship("Subscription", back_populates="user")
 
 
 class ChildProfile(Base, TimestampMixin):
@@ -105,6 +107,19 @@ class ChatMessage(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
     session = relationship("ChatSession", back_populates="messages")
+
+
+class RAGHistory(Base, TimestampMixin):
+    """RAG 探索问答历史表"""
+    __tablename__ = "rag_histories"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    child_id: Mapped[int] = mapped_column(ForeignKey("child_profiles.id"), index=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user / assistant
+    question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sources_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
 
 class MemoryEvent(Base, TimestampMixin):
@@ -173,13 +188,14 @@ class Subscription(Base, TimestampMixin):
     __tablename__ = "subscriptions"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
     plan_id: Mapped[int] = mapped_column(ForeignKey("subscription_plans.id"), nullable=False)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")  # ACTIVE / EXPIRED / CANCELLED
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")  # ACTIVE / CANCELLED / EXPIRED
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expire_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     auto_renew: Mapped[bool] = mapped_column(default=False, nullable=False)
 
+    user = relationship("User", back_populates="subscriptions")
     plan = relationship("SubscriptionPlan", back_populates="subscriptions")
     orders = relationship("PaymentOrder", back_populates="subscription")
 
@@ -196,29 +212,38 @@ class PaymentOrder(Base, TimestampMixin):
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     channel: Mapped[str] = mapped_column(String(20), nullable=False)  # ALIPAY / WECHAT
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")  # PENDING / PAID / FAILED / REFUNDED
-    trade_no: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    trade_no: Mapped[str | None] = mapped_column(String(128), nullable=True)  # 第三方流水号
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    raw_notify_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    raw_notify_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    user = relationship("User")
     subscription = relationship("Subscription", back_populates="orders")
     plan = relationship("SubscriptionPlan", back_populates="orders")
 
 
-class RAGHistory(Base, TimestampMixin):
-    """RAG 问答历史记录，用于保留多轮对话上下文。
+class NotificationType(str, enum.Enum):
+    SMS = "SMS"
+    EMAIL = "EMAIL"
 
-    每条记录表示一轮"问答"（一个 question + 它的 answer），
-    同一会话的记录通过 conversation_id 关联。
-    """
 
-    __tablename__ = "rag_histories"
+class NotificationStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+
+
+class NotificationLog(Base, TimestampMixin):
+    """通知发送日志审计表"""
+    __tablename__ = "notification_logs"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    conversation_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
-    child_id: Mapped[int] = mapped_column(
-        ForeignKey("child_profiles.id"), index=True, nullable=False
-    )
-    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user / assistant
-    question: Mapped[str | None] = mapped_column(Text, nullable=True)
-    answer: Mapped[str | None] = mapped_column(Text, nullable=True)
-    sources_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
+    channel: Mapped[NotificationType] = mapped_column(Enum(NotificationType), nullable=False)
+    receiver: Mapped[str] = mapped_column(String(128), nullable=False, index=True)  # 手机号或邮箱
+    template_code: Mapped[str] = mapped_column(String(64), nullable=False)  # 模板标识
+    content: Mapped[Text] = mapped_column(Text, nullable=False)
+    status: Mapped[NotificationStatus] = mapped_column(Enum(NotificationStatus), default=NotificationStatus.PENDING, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    user = relationship("User")

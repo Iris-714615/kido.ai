@@ -30,3 +30,6 @@ wechatpayv3>=0.4,<1.0
 qrcode>=7.4,<8.0
 jieba>=0.42,<1.0
 rank_bm25>=0.2,<1.0
+alibabacloud_dysmsapi20170525>=2.0.24,<3.0.0
+resend>=0.6.0,<1.0.0
+jinja2>=3.0.0,<4.0.0
