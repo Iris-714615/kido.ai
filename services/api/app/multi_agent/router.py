@@ -26,9 +26,56 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/stories", tags=["multi-agent-story"])
 
+# 后台任务引用集合：保存 asyncio.create_task 返回的引用，
+# 防止任务被 GC 中途回收（Python 官方文档推荐做法）。
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro) -> asyncio.Task:
+    """创建后台任务并保存引用，完成后自动从集合移除。"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 def _child_id(child: ChildProfile) -> str:
     return str(child.id)
+
+
+def _check_story_owner(story_id: str, child: ChildProfile) -> None:
+    """校验绘本归属权，防止 IDOR 越权访问他人绘本。
+
+    - 优先从 metadata.child_id 校验
+    - 若 metadata 不存在（流水线早期），从 pipeline state 的 request.child_id 校验
+    - 若两者都不存在，抛 404
+    - 若 child_id 为 None（旧数据/系统数据），允许访问
+    - 若 child_id 存在且不匹配，抛 403
+    """
+    meta = persistence.load_metadata(story_id)
+    owner = meta.child_id if meta else None
+
+    if owner is None and not meta:
+        # metadata 尚未创建，尝试从 pipeline state 读取归属权
+        try:
+            pipeline = get_pipeline()
+            state = pipeline.get_state({"configurable": {"thread_id": story_id}})
+            if state and state.values:
+                req = state.values.get("request") or {}
+                owner = req.get("child_id")
+        except Exception:  # noqa: BLE001
+            pass
+
+    if owner is None and not meta:
+        # 既无 metadata 也无 state，绘本不存在
+        raise HTTPException(status_code=404, detail="故事不存在")
+
+    if owner is not None and owner != _child_id(child):
+        logger.warning(
+            "IDOR 拦截: child=%s 试图访问 story_id=%s (owner=%s)",
+            _child_id(child), story_id, owner,
+        )
+        raise HTTPException(status_code=403, detail="无权访问该绘本")
 
 
 # ── 后台执行流水线 ────────────────────────────────────────
@@ -69,7 +116,7 @@ async def create_story(
     """孩子发起绘本创作，立即返回 story_id，后台异步执行完整流水线。"""
     request.child_id = _child_id(child)
     story_id = f"story_{uuid4().hex[:8]}"
-    asyncio.create_task(_run_pipeline_async(story_id, request))
+    _spawn_background_task(_run_pipeline_async(story_id, request))
     return StoryCreationResponse(
         story_id=story_id,
         status="creating",
@@ -84,6 +131,7 @@ async def get_status(
     child: ChildProfile = Depends(get_current_child_profile),
 ):
     """轮询当前流水线阶段与安全分数。"""
+    _check_story_owner(story_id, child)
     pipeline = get_pipeline()
     config = {"configurable": {"thread_id": story_id}}
     state = pipeline.get_state(config)
@@ -114,6 +162,7 @@ async def submit_review(
     child: ChildProfile = Depends(get_current_child_profile),
 ):
     """家长/运营提交人工审核结果，恢复被 interrupt_before 暂停的流水线。"""
+    _check_story_owner(story_id, child)
     pipeline = get_pipeline()
     config = {"configurable": {"thread_id": story_id}}
     state = pipeline.get_state(config)
@@ -127,7 +176,7 @@ async def submit_review(
         "reviewer_decision": decision.action,
         "reviewer_comment": decision.comment or "",
     })
-    asyncio.create_task(pipeline.ainvoke(None, config=config))
+    _spawn_background_task(pipeline.ainvoke(None, config=config))
 
     action_msg = {"approve": "已批准发布", "revise": "已提交修改意见", "reject": "已拒绝"}
     return {"story_id": story_id, "message": action_msg.get(decision.action, "已处理")}
@@ -139,6 +188,7 @@ async def get_result(
     child: ChildProfile = Depends(get_current_child_profile),
 ):
     """获取最终绘本内容（故事正文 + 配图 + 安全报告）。"""
+    _check_story_owner(story_id, child)
     meta = persistence.load_metadata(story_id)
     if not meta:
         raise HTTPException(status_code=404, detail="故事不存在")
@@ -157,6 +207,7 @@ async def stream_progress(
     child: ChildProfile = Depends(get_current_child_profile),
 ):
     """SSE 流式推送创作进度。"""
+    _check_story_owner(story_id, child)
     stage_labels = {
         "plan_story": "✍️ 正在规划故事大纲...",
         "planning_done": "✍️ 故事骨架已规划",
@@ -212,6 +263,7 @@ async def generate_images(
 
     立即返回起始事件，前端应转而订阅 SSE 流获取进度。
     """
+    _check_story_owner(story_id, child)
     meta = persistence.load_metadata(story_id)
     if not meta:
         raise HTTPException(status_code=404, detail="故事不存在")
@@ -237,7 +289,7 @@ async def generate_images(
         }
 
     # 后台异步生成（不阻塞响应）
-    asyncio.create_task(_run_image_generation(story_id, image_set))
+    _spawn_background_task(_run_image_generation(story_id, image_set))
     return {
         "story_id": story_id,
         "status": "started",
@@ -267,6 +319,7 @@ async def stream_image_progress(
     每张图片完成时推送一条事件，全部完成后推送 [DONE]。
     若图片已生成完毕，立即推送 complete 事件。
     """
+    _check_story_owner(story_id, child)
     meta = persistence.load_metadata(story_id)
     if not meta:
         raise HTTPException(status_code=404, detail="故事不存在")
@@ -297,6 +350,7 @@ async def get_images(
     child: ChildProfile = Depends(get_current_child_profile),
 ):
     """获取绘本所有图片清单（含本地路径与状态）。"""
+    _check_story_owner(story_id, child)
     meta = persistence.load_metadata(story_id)
     if not meta:
         raise HTTPException(status_code=404, detail="故事不存在")
@@ -320,6 +374,7 @@ async def get_image_file(
     child: ChildProfile = Depends(get_current_child_profile),
 ):
     """获取指定幕的图片文件（直接返回 png）。"""
+    _check_story_owner(story_id, child)
     from fastapi.responses import FileResponse
     path = persistence.get_image_path(story_id, act)
     if not path:
@@ -332,12 +387,13 @@ async def get_image_file(
 async def list_storybooks(
     child: ChildProfile = Depends(get_current_child_profile),
 ):
-    """「我的绘本集」列表：所有已发布绘本。
+    """「我的绘本集」列表：当前孩子拥有的已发布绘本。
 
     返回字段：story_id、title、target_age、safety_score、risk_level、
     cover_image_path、image_count、created_at、updated_at。
     """
-    items = persistence.list_all_stories()
+    # 仅返回当前孩子拥有的绘本，防止越权列出他人绘本
+    items = persistence.list_stories_by_child(_child_id(child))
     # 仅返回已发布 + 已生成图片的
     published = [
         it for it in items
@@ -355,6 +411,7 @@ async def package_storybook(
     child: ChildProfile = Depends(get_current_child_profile),
 ):
     """打包绘本为 zip 下载（含正文 + 图片 + manifest）。"""
+    _check_story_owner(story_id, child)
     import io
     import zipfile
     from fastapi.responses import StreamingResponse as _SS

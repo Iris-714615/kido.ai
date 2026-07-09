@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = "KidoAI"
+    # 运行环境：development / staging / production
+    # 用于在开发后门接口（mock-pay / demo-login / OTP 测试码）上添加生产环境守卫
+    app_env: str = "development"
     api_prefix: str = "/api/v1"
     database_url: str = "sqlite:///./data/kidoai.db"
     redis_url: str = "redis://localhost:6379/0"
@@ -103,12 +106,31 @@ class Settings(BaseSettings):
     wechat_notify_url: str = ""
 
     # 支付回调基础地址（用于拼接 notify/return URL）
-    payment_base_url: str = "http://localhost:8000"
+    payment_base_url: str = "http://localhost:8001"
+
+    # ========== TTS 语音合成 ==========
+    tts_provider: str = "fallback"  # dashscope / fallback
+    tts_model: str = "cosyvoice-v1"
+    tts_voice: str = "longxiaochun"  # 龙小纯，适合儿童
+    tts_sample_rate: int = 22050
 
     @field_validator("storage_dir", mode="before")
     @classmethod
     def _coerce_storage_dir(cls, value: object) -> Path:
         return Path(value) if not isinstance(value, Path) else value
+
+    @field_validator("secret_key")
+    @classmethod
+    def _check_secret_key(cls, value: str) -> str:
+        """生产环境拒绝弱默认密钥，防止 JWT 被离线伪造。"""
+        import os
+        app_env = os.getenv("APP_ENV", "development")
+        if app_env == "production" and value == "change-me":
+            raise ValueError(
+                "生产环境(APP_ENV=production)必须设置安全的 SECRET_KEY，"
+                "禁止使用默认值 'change-me'"
+            )
+        return value
 
     def ensure_directories(self) -> None:
         self.storage_dir.mkdir(parents=True, exist_ok=True)

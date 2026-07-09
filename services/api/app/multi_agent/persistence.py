@@ -129,3 +129,12 @@ def list_all_stories() -> list[dict]:
     # 按 updated_at 倒序
     items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     return items
+
+
+def list_stories_by_child(child_id: str) -> list[dict]:
+    """列出指定孩子拥有的绘本（按更新时间倒序）。
+
+    通过 metadata.child_id 字段过滤归属权，防止 IDOR 越权。
+    """
+    all_items = list_all_stories()
+    return [it for it in all_items if it.get("child_id") == child_id]

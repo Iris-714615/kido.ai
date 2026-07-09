@@ -157,7 +157,7 @@ app.component("bottom-nav", {
     <nav class="bottom-nav">
       <button v-for="item in navItems" :key="item.key"
         class="nav-item" :class="{active: route.tab === item.key}"
-        @click="switchTab(item.key)">
+        @click="handleNav(item)">
         <span class="nav-icon">{{ item.icon }}</span>
         <span class="nav-label">{{ item.label }}</span>
         <div class="nav-highlight"></div>
@@ -169,9 +169,21 @@ app.component("bottom-nav", {
       { key: "moments", label: "惊喜时刻", icon: "\u{2B50}" },
       { key: "location", label: "实时定位", icon: "\u{1F4CD}" },
       { key: "video", label: "视频沟通", icon: "\u{1F4F1}" },
+      { key: "ai-helper", label: "AI助手", icon: "\u{1F916}" },
       { key: "subscription", label: "订阅", icon: "\u{1F48E}" },
     ];
-    return { navItems, switchTab, route };
+    function handleNav(item) {
+      if (item.key === "ai-helper") {
+        const aiHost =
+          (location.hostname === "localhost" || location.hostname === "127.0.0.1")
+            ? "http://127.0.0.1:7860"
+            : location.origin.replace(/:\d+$/, ":7860");
+        window.open(aiHost, "_blank");
+        return;
+      }
+      switchTab(item.key);
+    }
+    return { navItems, handleNav, route };
   },
 });
 
@@ -338,8 +350,8 @@ app.component("growth-page", {
             <span class="sub">{{ greetingText }}</span>
           </div>
           <div class="top-actions">
-            <button class="icon-btn" title="通知">\u{1F514}</button>
-            <button class="icon-btn" title="更多">\u22EF</button>
+            <button class="icon-btn" title="通知" @click="switchTab('moments')">\u{1F514}</button>
+            <button class="icon-btn" title="更多" @click="switchTab('subscription')">\u22EF</button>
           </div>
         </div>
 
@@ -741,13 +753,17 @@ app.component("moments-page", {
           });
         }
 
-        // 聊天会话 → 时间线条目（取每个session的最后一条）
+        // 聊天会话 → 时间线条目（取每个session的最后一条消息）
         for (const s of (sessions || []).slice(0, 5)) {
-          const isUser = s.title?.includes("主页对话");
+          const msgs = (s.messages || []).slice().sort((a, b) =>
+            new Date(a.created_at) - new Date(b.created_at)
+          );
+          const last = msgs.length ? msgs[msgs.length - 1] : null;
+          const isUser = last ? last.role === "user" : (s.title?.includes("主页对话") || false);
           list.push({
             type: "chat",
-            time: fmtTime(s.updated_at || s.created_at),
-            text: isUser ? "今天问了好多有趣的问题呢~" : "你对什么感兴趣呢？我们一起去探索吧！",
+            time: fmtTime(last ? last.created_at : (s.updated_at || s.created_at)),
+            text: last ? last.content : "查看对话详情",
             img: null,
             self: isUser,
             childName: childName.value,

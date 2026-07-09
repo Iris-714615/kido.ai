@@ -21,7 +21,13 @@ def _serialize_child_profile(profile: ChildProfile | None) -> ChildProfilePublic
 
 @router.get("/demo", response_model=DemoResponse)
 def demo_login(db: Session = Depends(get_db_session)) -> DemoResponse:
+    """Demo 账号一键登录。
+
+    生产环境(app_env=production)下禁止调用，防止未鉴权获取 JWT token。
+    """
     settings = get_settings()
+    if settings.app_env == "production":
+        raise HTTPException(status_code=403, detail="生产环境禁止使用 demo 登录接口")
     user = db.scalar(select(User).where(User.username == settings.demo_username))
     if user is None:
         raise HTTPException(status_code=500, detail="Demo account not seeded")

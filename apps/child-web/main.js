@@ -1,9 +1,9 @@
-import { createApp, reactive, ref, onMounted, watch, nextTick } from "https://unpkg.com/vue@3/dist/vue.esm-browser.js";
+import { createApp, reactive, ref, onMounted, onUnmounted, watch, nextTick } from "https://unpkg.com/vue@3/dist/vue.esm-browser.js";
 
 // ========== API_BASE 策略 ==========
-// 开发环境（前端 5173 → 后端 8000 跨域）使用绝对地址
+// 开发环境使用 127.0.0.1（与页面同 host，避免 localhost/127.0.0.1 跨源 ORB 拦截）
 // 生产环境（同源 / 反代）使用相对路径
-const DEV_API_BASE = "http://localhost:8001/api/v1";
+const DEV_API_BASE = "http://127.0.0.1:8001/api/v1";
 const PROD_API_BASE = "/api/v1";
 const API_BASE =
   (location.hostname === "localhost" || location.hostname === "127.0.0.1") && location.port === "5173"
@@ -357,9 +357,22 @@ const StoryAPI = {
 };
 
 // ========== 路由 ==========
-const route = reactive({ path: location.hash.replace(/^#/, "") || "/" });
+function parseHash() {
+  // 支持 query string：#/story?story_id=xxx
+  const raw = location.hash.replace(/^#/, "") || "/";
+  const [pathPart, queryPart] = raw.split("?");
+  const path = pathPart || "/";
+  const query = {};
+  if (queryPart) {
+    new URLSearchParams(queryPart).forEach((v, k) => { query[k] = v; });
+  }
+  return { path, query };
+}
+const route = reactive(parseHash());
 window.addEventListener("hashchange", () => {
-  route.path = location.hash.replace(/^#/, "") || "/";
+  const { path, query } = parseHash();
+  route.path = path;
+  route.query = query;
 });
 
 // ========== 工具 ==========
@@ -623,12 +636,39 @@ app.component("home-page", {
         </div>
         <div class="chat-thread" ref="chatThread">
           <div v-for="(msg, i) in chatMessages" :key="i" class="bubble" :class="msg.role">
-            {{ msg.text }}
+            <span class="bubble-text">{{ msg.text }}</span>
+            <button
+              v-if="msg.role === 'assistant' && msg.text"
+              class="tts-btn"
+              :class="{ playing: playingIndex === i }"
+              @click="speak(i, msg.text)"
+              :title="playingIndex === i ? '停止播放' : '点击播放'"
+            >
+              {{ playingIndex === i ? '⏹' : '🔊' }}
+            </button>
           </div>
           <div v-if="chatLoading && !streamingText" class="bubble assistant loading">AI 正在思考...</div>
         </div>
+        <div class="chat-controls">
+          <label class="auto-play-toggle">
+            <input type="checkbox" v-model="autoPlay" />
+            <span>自动播放</span>
+          </label>
+          <span v-if="!speechSupported" class="stt-unsupported">浏览器不支持语音输入</span>
+        </div>
         <form class="chat-form" @submit.prevent="doChat">
-          <input v-model="chatInput" type="text" placeholder="输入你的问题..." autocomplete="off" :disabled="chatLoading" />
+          <button
+            v-if="speechSupported"
+            type="button"
+            class="stt-btn"
+            :class="{ listening: isListening }"
+            @click="toggleVoiceInput"
+            :title="isListening ? '点击停止' : '语音输入'"
+            :disabled="chatLoading"
+          >
+            {{ isListening ? '⏺' : '🎤' }}
+          </button>
+          <input v-model="chatInput" type="text" :placeholder="isListening ? '正在聆听...' : '输入你的问题...'" autocomplete="off" :disabled="chatLoading || isListening" />
           <button class="primary-btn" type="submit" :disabled="chatLoading || !chatInput.trim()">发送</button>
         </form>
       </div>
@@ -672,6 +712,46 @@ app.component("home-page", {
     const memoryEvents = ref([]);
     const memoryEntities = ref([]);
     const chatThread = ref(null);
+
+    // TTS 相关
+    const playingIndex = ref(-1);
+    const autoPlay = ref(false);
+    let currentAudio = null;
+
+    // STT 相关
+    const speechSupported = ref(false);
+    const isListening = ref(false);
+    let recognition = null;
+
+    // 初始化语音识别
+    if (typeof window !== 'undefined' && ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
+      speechSupported.value = true;
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognition = new SpeechRecognition();
+      recognition.lang = 'zh-CN';
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.onresult = (event) => {
+        let finalTranscript = '';
+        let interimTranscript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript;
+          } else {
+            interimTranscript += transcript;
+          }
+        }
+        chatInput.value = finalTranscript || interimTranscript;
+      };
+      recognition.onend = () => {
+        isListening.value = false;
+      };
+      recognition.onerror = (event) => {
+        console.error('Speech recognition error:', event.error);
+        isListening.value = false;
+      };
+    }
 
     function onFileChange(e) {
       const f = e.target.files?.[0] || null;
@@ -759,6 +839,10 @@ app.component("home-page", {
         );
         streamingText.value = "";
         await loadMemory();
+        // 如果开启自动播放，播放 AI 回复
+        if (autoPlay.value && chatMessages.value[idx].text) {
+          speak(idx, chatMessages.value[idx].text);
+        }
       } catch (e) {
         chatMessages.value[idx].text = "请求失败：" + e.message;
       } finally {
@@ -774,6 +858,114 @@ app.component("home-page", {
         memoryEntities.value = data.entities || [];
       } catch (_) {}
     }
+
+    /** TTS：播放文本语音 */
+    async function speak(index, text) {
+      // 如果点击正在播放的消息，停止播放
+      if (playingIndex.value === index) {
+        stopSpeaking();
+        return;
+      }
+      // 停止之前的播放
+      stopSpeaking();
+      playingIndex.value = index;
+
+      // 优先尝试后端 TTS API
+      try {
+        const token = localStorage.getItem('kidoai_token') || '';
+        const ttsApiBase = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+          ? 'http://127.0.0.1:8001/api/v1' : '/api/v1';
+        const resp = await fetch(`${ttsApiBase}/chat/tts`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({ text }),
+        });
+        if (resp.ok) {
+          const blob = await resp.blob();
+          // 检查是否是静音 fallback（很短的 WAV）
+          if (blob.size > 100) {
+            const url = URL.createObjectURL(blob);
+            currentAudio = new Audio(url);
+            currentAudio.onended = () => {
+              playingIndex.value = -1;
+              URL.revokeObjectURL(url);
+            };
+            currentAudio.onerror = () => {
+              playingIndex.value = -1;
+              // 降级到浏览器 TTS
+              _browserSpeak(text);
+            };
+            await currentAudio.play();
+            return;
+          }
+        }
+        // 后端不支持或返回静音，降级到浏览器 TTS
+        _browserSpeak(text);
+      } catch (e) {
+        console.warn('Backend TTS failed, fallback to browser:', e);
+        _browserSpeak(text);
+      }
+    }
+
+    /** 浏览器内置 TTS 降级方案 */
+    function _browserSpeak(text) {
+      if (!('speechSynthesis' in window)) {
+        playingIndex.value = -1;
+        return;
+      }
+      speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'zh-CN';
+      utterance.rate = 0.9;
+      utterance.pitch = 1.1;
+      utterance.onend = () => {
+        playingIndex.value = -1;
+      };
+      utterance.onerror = () => {
+        playingIndex.value = -1;
+      };
+      speechSynthesis.speak(utterance);
+    }
+
+    /** 停止播放 */
+    function stopSpeaking() {
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio = null;
+      }
+      if ('speechSynthesis' in window) {
+        speechSynthesis.cancel();
+      }
+      playingIndex.value = -1;
+    }
+
+    /** 切换语音输入 */
+    function toggleVoiceInput() {
+      if (!recognition) return;
+      if (isListening.value) {
+        recognition.stop();
+        isListening.value = false;
+      } else {
+        chatInput.value = '';
+        try {
+          recognition.start();
+          isListening.value = true;
+        } catch (e) {
+          console.error('Recognition start failed:', e);
+        }
+      }
+    }
+
+    // 组件卸载时清理
+    onUnmounted(() => {
+      stopSpeaking();
+      if (recognition && isListening.value) {
+        recognition.stop();
+      }
+    });
 
     onMounted(async () => {
       await loadMemory();
@@ -797,6 +989,12 @@ app.component("home-page", {
       doChat,
       fmtTime,
       assetUrl,
+      playingIndex,
+      autoPlay,
+      speechSupported,
+      isListening,
+      speak,
+      toggleVoiceInput,
     };
   },
 });
@@ -900,6 +1098,20 @@ app.component("chat-list-page", {
     async function selectSession(id) {
       currentId.value = id;
       messages.value = [];
+      try {
+        const detail = await ChatAPI.getSession(id);
+        if (detail.messages && detail.messages.length) {
+          messages.value = detail.messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+          }));
+          await nextTick();
+          scrollToBottom(chatThread.value);
+        }
+      } catch (e) {
+        // 加载历史失败不阻塞当前会话
+        console.warn("加载会话历史失败:", e.message);
+      }
     }
 
     async function newSession() {
@@ -1235,7 +1447,7 @@ app.component("story-create-page", {
                 </span>
               </div>
               <div class="image-cell-body">
-                <img v-if="evt.status === 'succeeded'" :src="imageUrl(evt.act)" :alt="evt.scene_cn" />
+                <img v-if="evt.status === 'succeeded'" :src="imageUrl(evt.act)" :alt="evt.scene_cn" crossorigin="anonymous" />
                 <div v-else-if="evt.status === 'failed'" class="image-cell-err">{{ evt.error }}</div>
                 <div v-else class="image-cell-loading">正在绘制…</div>
               </div>
@@ -1376,6 +1588,68 @@ app.component("story-create-page", {
       }
     }
 
+    // 加载已有绘本的图片清单（用于从绘本集跳转进入的场景）
+    async function loadExistingImages() {
+      if (!currentStoryId.value) return;
+      try {
+        const data = await StoryAPI.getImages(currentStoryId.value);
+        const list = Array.isArray(data)
+          ? data
+          : (data.items || data.images || []);
+        if (!list.length) return;
+        imageEvents.value = list.map((img) => ({
+          act: img.act,
+          scene_cn: img.scene_cn || "",
+          status: "succeeded",
+          progress: 100,
+          image_url: img.image_url || null,
+          local_path: img.local_path || null,
+          error: null,
+        }));
+        imageSummary.value = {
+          total: list.length,
+          succeeded: list.length,
+          failed: 0,
+        };
+      } catch (e) {
+        // 图片加载失败不阻塞绘本展示
+        console.warn("加载绘本图片失败:", e.message);
+      }
+    }
+
+    // 加载已有绘本（通过路由 ?story_id=xxx 进入）
+    async function loadExistingStory(storyId) {
+      currentStoryId.value = storyId;
+      result.value = null;
+      pendingReview.value = false;
+      try {
+        const data = await StoryAPI.status(storyId);
+        const stage = data.stage;
+        if (stage && stage !== "init") updateProgress(stage);
+        const score = data.safety_score ?? "-";
+        const risk = data.risk_level ?? "-";
+        statusText.value = "阶段: " + stage + "  ·  得分: " + score + "  ·  等级: " + risk;
+        if (stage === "published") {
+          // 已完成：标记全部进度完成，拉取结果与图片
+          progressList.value.forEach((p) => {
+            p.state = "done";
+            p.stateText = "完成 ✓";
+          });
+          await fetchResult();
+          await loadExistingImages();
+        } else if (data.pending_review) {
+          pendingReview.value = true;
+        } else if (["rejected", "failed"].includes(stage)) {
+          // 终态，不再轮询
+        } else if (stage && stage !== "init") {
+          // 仍在创作中，继续轮询跟进
+          startPolling();
+        }
+      } catch (e) {
+        progressError.value = "加载绘本失败: " + e.message;
+      }
+    }
+
     async function submitReview(action) {
       if (!currentStoryId.value) return;
       if (action === "revise" && !reviewComment.value.trim()) {
@@ -1485,6 +1759,12 @@ app.component("story-create-page", {
         .catch((e) => { imageError.value = "下载失败: " + e.message; });
     }
 
+    // 从绘本集跳转进入：通过 ?story_id=xxx 加载已有绘本
+    const initialStoryId = route.query && route.query.story_id;
+    if (initialStoryId) {
+      loadExistingStory(String(initialStoryId));
+    }
+
     return {
       prompt,
       targetAge,
@@ -1577,7 +1857,7 @@ app.component("storybook-list-page", {
     }
 
     function coverUrl(storyId) {
-      return \`\${DEV_API_BASE}/stories/\${storyId}/images/1/file?_t=\${Date.now()}\`;
+      return StoryAPI.imageUrl(storyId, 1);
     }
 
     function formatDate(s) {
@@ -1587,17 +1867,17 @@ app.component("storybook-list-page", {
 
     function openBook(book) {
       // 跳转到绘本创作页并加载该 story
-      location.hash = `#/story?story_id=\${book.story_id}`;
+      location.hash = `#/story?story_id=${book.story_id}`;
     }
 
     function downloadBook(book) {
       const url = StoryAPI.packageUrl(book.story_id);
-      fetch(url, { headers: { Authorization: \`Bearer \${store.token}\` } })
+      fetch(url, { headers: { Authorization: `Bearer ${store.token}` } })
         .then((r) => r.blob())
         .then((b) => {
           const a = document.createElement("a");
           a.href = URL.createObjectURL(b);
-          a.download = \`storybook_\${book.story_id}.zip\`;
+          a.download = `storybook_${book.story_id}.zip`;
           a.click();
           URL.revokeObjectURL(a.href);
         })

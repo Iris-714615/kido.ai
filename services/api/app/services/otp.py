@@ -92,12 +92,17 @@ def generate_otp(phone: str, user_id: int | None = None) -> str:
 def verify_otp(phone: str, code: str) -> bool:
     """验证手机验证码是否正确。
 
-    Fallback 模式（sms_provider == 'fallback'）下接受固定测试码 123456，
-    便于本地开发与联调测试。
+    安全策略：
+    - 生产环境(app_env=production)：禁止任何固定测试码，必须走 Redis 校验；
+      Redis 不可用时直接拒绝验证，防止认证绕过。
+    - 非生产环境：Fallback 模式或 Redis 不可用时接受固定测试码 123456，
+      便于本地开发与联调测试。
     """
     settings = get_settings()
-    # Fallback 开发测试模式：接受固定测试码 123456
-    if settings.sms_provider == "fallback" and code == "123456":
+    is_production = settings.app_env == "production"
+
+    # 非生产环境 + Fallback 开发测试模式：接受固定测试码 123456
+    if not is_production and settings.sms_provider == "fallback" and code == "123456":
         logger.info("[SMS Mock] Verify OTP with test code 123456 for %s", phone)
         return True
 
@@ -110,8 +115,16 @@ def verify_otp(phone: str, code: str) -> bool:
                 return True
         except Exception as exc:
             logger.error("Failed to read OTP from Redis: %s", exc)
+            # 生产环境 Redis 异常时拒绝验证，防止降级到测试码
+            if is_production:
+                return False
     else:
-        # Redis 不可用时进入 Mock 模式
+        # Redis 不可用
+        if is_production:
+            # 生产环境禁止 Mock 模式，防止认证绕过
+            logger.error("[Security] Redis unavailable in production, OTP verify rejected for %s", phone)
+            return False
+        # 非生产环境进入 Mock 模式
         logger.warning("[Redis Mock] Verify OTP in Mock Mode for %s", phone)
         return code == "123456"
     return False

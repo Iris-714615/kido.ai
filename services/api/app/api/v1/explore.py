@@ -7,12 +7,23 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.core.settings import get_settings
-from app.dependencies import get_current_child_profile, get_db_session
+from app.dependencies import check_explore_quota, get_current_child_profile, get_db_session
 from app.models import ChildProfile, ExploreRecord
 from app.schemas import ExploreRecordPublic, ExploreResponse
 from app.services.explore import process_explore_upload
 
 router = APIRouter(prefix="/explore", tags=["explore"])
+
+# 后台任务引用集合：保存 asyncio.create_task 返回的引用，防止 GC 回收
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro) -> asyncio.Task:
+    """创建后台任务并保存引用，完成后自动从集合移除。"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 @router.post("/image", response_model=ExploreResponse)
@@ -20,6 +31,7 @@ async def analyze_image(
     file: UploadFile = File(...),
     db: Session = Depends(get_db_session),
     child: ChildProfile = Depends(get_current_child_profile),
+    _quota=Depends(check_explore_quota),
 ) -> ExploreResponse:
     settings = get_settings()
     try:
@@ -46,7 +58,7 @@ async def analyze_image(
             import logging
             logging.getLogger(__name__).warning("探索后成长档案生成失败: %s", e)
 
-    asyncio.create_task(_update_growth_report())
+    _spawn_background_task(_update_growth_report())
 
     return ExploreResponse(record=ExploreRecordPublic.model_validate(record), memory_events=memory_events)
 

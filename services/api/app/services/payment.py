@@ -84,10 +84,24 @@ def alipay_create_payment(order_no: str, amount_cents: int, subject: str) -> dic
 
 
 def alipay_verify_notify(data: dict[str, Any]) -> bool:
-    """验证支付宝异步通知签名。"""
+    """验证支付宝异步通知签名。
+
+    安全策略：
+    - 生产环境：密钥未配置时拒绝验签，防止伪造支付通知
+    - 非生产环境：Mock 模式下直接信任，便于本地联调
+    """
     client = _get_alipay_client()
     if client is None:
-        # Mock 模式：直接信任
+        settings = get_settings()
+        if settings.app_env == "production":
+            # 生产环境密钥未配置，拒绝验签防止支付伪造
+            logger.error(
+                "[Security] Alipay keys not configured in production, "
+                "notify verification rejected for order %s",
+                data.get("out_trade_no"),
+            )
+            return False
+        # 非生产环境 Mock 模式：直接信任
         return data.get("mock") is not None or data.get("trade_status") == "TRADE_SUCCESS"
 
     try:
@@ -168,10 +182,20 @@ def wechat_create_payment(order_no: str, amount_cents: int, description: str) ->
 
 
 def wechat_verify_notify(headers: dict[str, str], body: bytes) -> dict[str, Any] | None:
-    """验证微信支付异步通知并解密。返回解密后的通知体，失败返回 None。"""
+    """验证微信支付异步通知并解密。返回解密后的通知体，失败返回 None。
+
+    安全策略：
+    - 生产环境：密钥未配置时拒绝验签，防止伪造支付通知
+    - 非生产环境：Mock 模式下直接解析，便于本地联调
+    """
     client = _get_wechat_client()
     if client is None:
-        # Mock 模式
+        settings = get_settings()
+        if settings.app_env == "production":
+            # 生产环境密钥未配置，拒绝验签防止支付伪造
+            logger.error("[Security] WeChat keys not configured in production, notify verification rejected")
+            return None
+        # 非生产环境 Mock 模式
         try:
             return json.loads(body)
         except Exception:

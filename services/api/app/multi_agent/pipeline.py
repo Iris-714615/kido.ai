@@ -59,6 +59,7 @@ async def plan_story_node(state: StoryPipelineState):
         target_age=blueprint.target_age,
         status="creating",
         revision_count=0,
+        child_id=req.get("child_id"),
     ))
     return {
         "blueprint": blueprint.model_dump(),

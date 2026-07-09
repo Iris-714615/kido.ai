@@ -1,11 +1,22 @@
+from datetime import datetime, timezone
+
 from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.security import decode_access_token
 from app.core.settings import get_settings
 from app.db.session import get_db
-from app.models import ChildProfile, Subscription, SubscriptionPlan, User, UserRole
+from app.models import (
+    ChatMessage,
+    ChatSession,
+    ChildProfile,
+    ExploreRecord,
+    Subscription,
+    SubscriptionPlan,
+    User,
+    UserRole,
+)
 
 
 def get_db_session() -> Session:
@@ -92,4 +103,74 @@ def check_feature_access(features: dict, feature_name: str) -> None:
             status_code=403,
             detail=f"当前套餐不支持此功能，请升级订阅",
         )
+
+
+# ========== 当日配额检查 ==========
+
+
+class _DailyQuotaChecker:
+    """检查当日使用配额的依赖工厂。免费用户超出配额则抛 403。
+
+    配额取自订阅套餐 features_json 中的对应键：
+    - explore_daily_limit：每日探索次数上限
+    - chat_daily_limit：每日对话次数上限
+    其中 -1 表示无限制（付费套餐）。
+    """
+
+    def __init__(self, feature_key: str, quota_label: str) -> None:
+        self.feature_key = feature_key
+        self.quota_label = quota_label
+
+    def __call__(
+        self,
+        child: ChildProfile = Depends(get_current_child_profile),
+        db: Session = Depends(get_db_session),
+    ) -> None:
+        from app.core.bootstrap import ensure_free_subscription
+
+        # 确定订阅所属用户：优先 parent，回退 child user（demo 账户无 parent）
+        subscriber_id = child.parent_user_id if child.parent_user_id is not None else child.user_id
+        sub = ensure_free_subscription(db, subscriber_id)
+        plan = db.get(SubscriptionPlan, sub.plan_id)
+
+        limit = plan.features_json.get(self.feature_key) if plan else None
+        # 未配置限制或 -1 表示无限制（付费套餐），直接放行
+        if limit is None or limit == -1:
+            return
+
+        today = datetime.now(timezone.utc).date()
+        # 统计当日使用量：若有 parent 则统计其名下所有 child，否则仅统计当前 child
+        if child.parent_user_id is not None:
+            child_ids = select(ChildProfile.id).where(ChildProfile.parent_user_id == child.parent_user_id)
+        else:
+            child_ids = [child.id]
+
+        if self.feature_key == "explore_daily_limit":
+            count = db.scalar(
+                select(func.count(ExploreRecord.id)).where(
+                    ExploreRecord.child_id.in_(child_ids),
+                    func.date(ExploreRecord.created_at) == today,
+                )
+            ) or 0
+        elif self.feature_key == "chat_daily_limit":
+            session_ids = select(ChatSession.id).where(ChatSession.child_id.in_(child_ids))
+            count = db.scalar(
+                select(func.count(ChatMessage.id)).where(
+                    ChatMessage.session_id.in_(session_ids),
+                    ChatMessage.role == "user",
+                    func.date(ChatMessage.created_at) == today,
+                )
+            ) or 0
+        else:
+            return
+
+        if count >= limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"今日{self.quota_label}次数已达免费上限（{limit}次/天），请升级订阅",
+            )
+
+
+check_explore_quota = _DailyQuotaChecker("explore_daily_limit", "探索")
+check_chat_quota = _DailyQuotaChecker("chat_daily_limit", "对话")
 

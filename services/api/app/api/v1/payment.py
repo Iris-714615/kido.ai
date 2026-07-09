@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.bootstrap import ensure_free_subscription
+from app.core.settings import get_settings
 from app.dependencies import get_current_parent, get_db_session
 from app.models import PaymentOrder, Subscription, SubscriptionPlan, User
 from app.schemas import CreateOrderRequest, CreateOrderResponse, OrderStatusResponse
@@ -27,6 +28,17 @@ from app.services.payment import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/payment", tags=["payment"])
+
+# 后台任务引用集合：保存 asyncio.create_task 返回的引用，防止 GC 回收
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro) -> asyncio.Task:
+    """创建后台任务并保存引用，完成后自动从集合移除。"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 @router.post("/create-order", response_model=CreateOrderResponse)
@@ -217,7 +229,13 @@ def mock_pay(
     current_parent: User = Depends(get_current_parent),
     db: Session = Depends(get_db_session),
 ) -> dict:
-    """模拟支付成功（仅开发环境使用，跳过真实支付流程）。"""
+    """模拟支付成功（仅开发环境使用，跳过真实支付流程）。
+
+    生产环境(app_env=production)下禁止调用，防止绕过真实支付。
+    """
+    settings = get_settings()
+    if settings.app_env == "production":
+        raise HTTPException(status_code=403, detail="生产环境禁止使用 mock-pay 接口")
     order = db.scalar(select(PaymentOrder).where(PaymentOrder.order_no == order_no))
     if order is None:
         raise HTTPException(status_code=404, detail="订单不存在")
@@ -251,11 +269,12 @@ def _activate_subscription(db: Session, order: PaymentOrder) -> None:
     start_at, expire_at = calc_subscription_period(plan.billing_cycle)
 
     # 如果当前订阅未过期，在原到期时间基础上续期
-    # 注意：SQLite 返回 naive datetime，需统一用 naive UTC
-    now = datetime.utcnow()
+    # 统一使用 aware UTC，与同文件其它时间字段(paid_at 等)保持一致
+    now = datetime.now(timezone.utc)
     sub_expire = sub.expire_at
-    if sub_expire and sub_expire.tzinfo is not None:
-        sub_expire = sub_expire.replace(tzinfo=None)
+    if sub_expire and sub_expire.tzinfo is None:
+        # SQLite 可能返回 naive datetime，补齐 tzinfo 为 UTC
+        sub_expire = sub_expire.replace(tzinfo=timezone.utc)
     if sub_expire and sub_expire > now and sub.status == "ACTIVE":
         base = sub_expire
     else:
@@ -302,7 +321,7 @@ def _activate_subscription(db: Session, order: PaymentOrder) -> None:
             "plan_code": plan.code,
         }
         try:
-            asyncio.create_task(_send_payment_notification_async(notif_snapshot))
+            _spawn_background_task(_send_payment_notification_async(notif_snapshot))
         except RuntimeError:
             # 没有 event loop（同步调用上下文）→ 退化为同步发送
             _send_payment_notification_sync(notif_snapshot)

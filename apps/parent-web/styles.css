@@ -15,6 +15,7 @@
   --shadow: 0 2px 12px rgba(255, 154, 60, 0.15);
   --radius: 16px;
   --nav-h: 64px;
+  --soft: #FFF0E0;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }

@@ -30,10 +30,21 @@ services:
       - ./data:/data
       - ./services/api:/app
     ports:
-      - "8000:8000"
+      - "8001:8001"
     depends_on:
       - mysql
       - redis
+
+  parent-web:
+    image: node:18
+    working_dir: /app
+    volumes:
+      - ./apps/parent-web:/app
+    command: npm install && npx vite --host 0.0.0.0 --port 5174
+    ports:
+      - "5174:5174"
+    depends_on:
+      - api
 
   child-web:
     build:
@@ -41,6 +52,54 @@ services:
     ports:
       - "5173:5173"
 
+  parent-chat:
+    build:
+      context: ./services/parent-chat
+    environment:
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      PARENT_CHAT_HOST: 0.0.0.0
+      PARENT_CHAT_PORT: "7860"
+    volumes:
+      - parent_chat_storage:/app/data/storage
+    ports:
+      - "7860:7860"
+
+  # 知识图谱服务 (Neo4j + Gradio)
+  neo4j:
+    image: neo4j:2026.05-community
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-123456abc}
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474"   # HTTP Browser
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  neo4j-gradio:
+    build:
+      context: ./services/Neo4j
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-123456abc}
+      NEO4J_GRADIO_HOST: 0.0.0.0
+      NEO4J_GRADIO_PORT: "7861"
+    ports:
+      - "7861:7861"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
 volumes:
   mysql_data:
-
+  parent_chat_storage:
+  neo4j_data:
+  neo4j_logs:

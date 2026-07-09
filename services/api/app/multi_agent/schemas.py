@@ -103,6 +103,8 @@ class StoryMetadata(BaseModel):
     revision_count: int = 0
     cover_image_path: Optional[str] = None
     image_count: int = 0
+    # 归属权字段：用于校验绘本归属，防止 IDOR 越权访问
+    child_id: Optional[str] = None
 
 
 class ImageManifestItem(BaseModel):
